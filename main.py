@@ -84,6 +84,7 @@ from telegram.ext import (
 
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "posted_news.json"   # сюда бот запоминает уже опубликованное
+NEWS_CACHE_FILE = BASE_DIR / "news_cache.json"  # кэш последних новостей (про запас)
 LOG_FILE = BASE_DIR / "bot.log"
 
 # ID канала, в который бот публикует новости (указан владельцем: 4421879537).
@@ -105,10 +106,18 @@ CHECK_INTERVAL_MINUTES = 120   # период проверки источник�
 MAX_POSTS_PER_CYCLE = 3        # максимум новостей за один плановый проход
 MAX_POSTS_ON_START = 3         # максимум новостей сразу после добавления в канал
 PAUSE_BETWEEN_POSTS = 3        # пауза между постами, сек (антифлуд)
-HTTP_TIMEOUT = 20              # таймаут загрузки источников, сек
+HTTP_TIMEOUT = 30              # таймаут загрузки источников, сек
+FETCH_ATTEMPTS = 3             # попыток загрузки каждого источника
+FETCH_RETRY_PAUSE = 2.0        # пауза между попытками, сек
 MAX_SEEN_ENTRIES = 2000        # сколько опубликованных ID хранить в состоянии
+MAX_CACHE_ITEMS = 80           # сколько свежих новостей держать в кэше про запас
 
-USER_AGENT = "Mozilla/5.0 (compatible; MinecraftNewsBot/1.0)"
+# Обычные bot-UA некоторые сайты блокируют, поэтому притворяемся браузером
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+ACCEPT_LANGUAGE = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
 
 ACTIVE_STATUSES = (
     ChatMemberStatus.MEMBER,
@@ -279,14 +288,26 @@ def parse_rss_date(struct_time: Any) -> Optional[dt.datetime]:
 # ---------------------------------------------------------------------------
 
 
-async def _http_get(client: httpx.AsyncClient, url: str) -> Optional[bytes]:
-    try:
-        response = await client.get(url)
-        response.raise_for_status()
-        return response.content
-    except Exception as exc:  # noqa: BLE001 — любой сетевой сбой не должен ронять бота
-        logger.warning("Не удалось загрузить %s: %s", url, exc)
-        return None
+async def _http_get(client: httpx.AsyncClient, url: str) -> tuple[Optional[bytes], str]:
+    """GET с повторами. Возвращает (тело | None, текст ошибки; "" если ок)."""
+    last_err = ""
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            response = await client.get(url)
+            if response.status_code == 200:
+                return response.content, ""
+            last_err = f"HTTP {response.status_code}"
+            logger.warning(
+                "%s → HTTP %s (попытка %d/%d)", url, response.status_code, attempt, FETCH_ATTEMPTS
+            )
+        except Exception as exc:  # noqa: BLE001 — сетевой сбой не должен ронять бота
+            last_err = f"{type(exc).__name__}: {str(exc)[:120]}"
+            logger.warning(
+                "%s → ошибка: %s (попытка %d/%d)", url, last_err, attempt, FETCH_ATTEMPTS
+            )
+        if attempt < FETCH_ATTEMPTS:
+            await asyncio.sleep(FETCH_RETRY_PAUSE * attempt)
+    return None, last_err
 
 
 def parse_mojang(source: Source, raw: bytes) -> list[NewsItem]:
@@ -393,13 +414,23 @@ def parse_rss(source: Source, raw: bytes) -> list[NewsItem]:
     return items
 
 
-async def fetch_source(client: httpx.AsyncClient, source: Source) -> list[NewsItem]:
-    raw = await _http_get(client, source.url)
-    if not raw:
-        return []
+async def fetch_source(client: httpx.AsyncClient, source: Source) -> tuple[list[NewsItem], str]:
+    """Загружает и разбирает один источник.
+
+    Возвращает (список новостей, текст ошибки; "" если всё хорошо).
+    """
+    raw, err = await _http_get(client, source.url)
+    if raw is None:
+        return [], f"❌ {source.name}: {err or 'нет ответа'}"
     if source.kind == "mojang":
-        return parse_mojang(source, raw)
-    return parse_rss(source, raw)
+        items = parse_mojang(source, raw)
+    else:
+        items = parse_rss(source, raw)
+    if not items and source.keywords:
+        return [], (
+            f"⚪ {source.name}: лента доступна, но новостей про Minecraft сейчас нет"
+        )
+    return items, ""
 
 
 def order_ru_first(items: list[NewsItem]) -> list[NewsItem]:
@@ -409,17 +440,74 @@ def order_ru_first(items: list[NewsItem]) -> list[NewsItem]:
     return ru_items + en_items
 
 
-async def fetch_all_news() -> list[NewsItem]:
+def _item_to_cache(item: NewsItem) -> dict[str, Any]:
+    return {
+        "source_key": item.source_key,
+        "source_name": item.source_name,
+        "item_id": item.item_id,
+        "title": item.title,
+        "text": item.text,
+        "url": item.url,
+        "published": item.published.isoformat() if item.published else None,
+        "image_url": item.image_url,
+        "lang": item.lang,
+    }
+
+
+def _item_from_cache(data: dict[str, Any]) -> Optional[NewsItem]:
+    try:
+        published_raw = data.get("published")
+        return NewsItem(
+            source_key=str(data.get("source_key") or "cache"),
+            source_name=str(data.get("source_name") or "Кэш"),
+            item_id=str(data.get("item_id") or ""),
+            title=str(data.get("title") or ""),
+            text=str(data.get("text") or ""),
+            url=str(data.get("url") or ""),
+            published=dt.datetime.fromisoformat(published_raw) if published_raw else None,
+            image_url=data.get("image_url"),
+            lang=str(data.get("lang") or "ru"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def save_news_cache(items: list[NewsItem]) -> None:
+    try:
+        payload = [_item_to_cache(i) for i in items[:MAX_CACHE_ITEMS]]
+        NEWS_CACHE_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("Не удалось сохранить кэш новостей: %s", exc)
+
+
+def load_news_cache() -> list[NewsItem]:
+    try:
+        payload = json.loads(NEWS_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [i for i in (_item_from_cache(d) for d in payload) if i and i.title]
+
+
+async def fetch_all_news() -> tuple[list[NewsItem], list[str]]:
     """Собирает новости со всех источников.
 
-    Возвращает список, где первыми идут русскоязычные новости (от свежих к
-    старым), затем англоязычные (если INCLUDE_ENGLISH_SOURCES = True).
+    Возвращает (список новостей, список строк-диагностики по каждому источнику).
+    Русскоязычные новости идут первыми. Если ни один источник не ответил —
+    используются последние сохранённые новости из кэша (news_cache.json).
     """
     active_sources = [
         s for s in SOURCES
         if INCLUDE_ENGLISH_SOURCES or s.lang == "ru"
     ]
-    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, application/rss+xml, application/xml, text/xml, */*",
+        "Accept-Language": ACCEPT_LANGUAGE,
+    }
     async with httpx.AsyncClient(
         headers=headers, timeout=HTTP_TIMEOUT, follow_redirects=True
     ) as client:
@@ -429,12 +517,17 @@ async def fetch_all_news() -> list[NewsItem]:
         )
 
     items: list[NewsItem] = []
+    diag: list[str] = []
     for source, result in zip(active_sources, results):
         if isinstance(result, BaseException):
-            logger.warning("Источник %s недоступен: %s", source.name, result)
+            diag.append(f"❌ {source.name}: сбой {type(result).__name__}: {result}")
+            logger.warning("Источник %s упал с исключением: %s", source.name, result)
             continue
-        logger.info("Источник «%s»: получено %d новостей", source.name, len(result))
-        items.extend(result)
+        source_items, err = result
+        diag.append(err or f"✅ {source.name}: {len(source_items)} нов. про Minecraft")
+        if source_items:
+            logger.info("Источник «%s»: получено %d новостей", source.name, len(source_items))
+            items.extend(source_items)
 
     # от новых к старым
     epoch = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
@@ -449,8 +542,17 @@ async def fetch_all_news() -> list[NewsItem]:
         seen_titles.add(item.title_hash)
         unique.append(item)
 
-    # русскоязычные новости — вперёд
-    return order_ru_first(unique)
+    if not unique:
+        cached = load_news_cache()
+        if cached:
+            diag.append(
+                f"♻️ Источники недоступны — беру последние {len(cached)} новостей из кэша"
+            )
+            unique = cached
+    else:
+        save_news_cache(unique)
+
+    return order_ru_first(unique), diag
 
 
 # ---------------------------------------------------------------------------
@@ -573,9 +675,11 @@ async def publish_new_items(
     bot: Bot, limit: int, chat_id: Optional[int] = None
 ) -> int:
     """Забирает новости из источников и публикует ещё не опубликованные."""
-    items = await fetch_all_news()
+    items, diag = await fetch_all_news()
     if not items:
-        logger.warning("Ни один источник не вернул новости")
+        logger.warning("Ни один источник не вернул новости:")
+        for line in diag:
+            logger.warning("  %s", line)
         return 0
 
     seen = load_seen()
@@ -711,14 +815,16 @@ async def on_check_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     try:
-        items = await fetch_all_news()
+        items, diag = await fetch_all_news()
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка получения новостей по кнопке: %s", exc)
-        items = []
+        items, diag = [], []
 
     if not items:
+        detail = "\n".join(diag) if diag else "источники не ответили"
         await status.edit_text(
-            "⚠️ Не удалось получить новости из источников. Попробуй позже."
+            "⚠️ Не удалось получить новости из источников. "
+            "Попробуй позже.\n\n" + html.escape(detail)[:3500]
         )
         return
 
